@@ -73,10 +73,42 @@ app.webSocket("ws") { req, ws in
     let (room, me) = manager.join(room: code, name: name, ws: ws)
 
     ws.onText { ws, text in
-        if text == "\"start\"" {
-            manager.start(code: code)
+    if text == "\"start\"" {
+        manager.start(code: code)
+        return
+    }
+
+    // Try parse small JSON messages from clients
+    if let data = text.data(using: .utf8),
+       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+
+        // Broadcast phase change as a system message "phase:night" / "phase:day"
+        if let phase = obj["phase"] as? String, (phase == "night" || phase == "day") {
+            let sys = Outbound.system("phase:\(phase)")
+            if let sysText = String(data: try! JSONEncoder().encode(sys), encoding: .utf8) {
+                if let r = manager.rooms[code] {
+                    for (pid, peer) in manager.sockets where manager.playerRoom[pid] == r.code {
+                        peer.send(sysText)
+                    }
+                }
+            }
+            return
+        }
+
+        // Mafia chat or global chat
+        if let msg = obj["chat"] as? String {
+            let chat = Outbound.chat(msg)
+            if let chatText = String(data: try! JSONEncoder().encode(chat), encoding: .utf8) {
+                if let r = manager.rooms[code] {
+                    for (pid, peer) in manager.sockets where manager.playerRoom[pid] == r.code {
+                        peer.send(chatText)
+                    }
+                }
+            }
+            return
         }
     }
+}
 
     ws.onClose.whenComplete { _ in
         manager.disconnect(playerID: me.id)
