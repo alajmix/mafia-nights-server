@@ -1,118 +1,212 @@
 import Vapor
+import Foundation
 
-struct Player: Codable, Hashable { let id: UUID; let name: String }
-struct Room: Codable { let id: UUID; let code: String; var players: [Player] = []; var started: Bool = false }
+// MARK: - Wire models
 
-enum Outbound: Codable { case room(Room); case system(String); case chat(String) }
+struct SPlayer: Codable {
+    let id: UUID
+    let name: String
+}
+
+struct SRoom: Codable {
+    let id: UUID
+    let code: String
+    let players: [SPlayer]
+    let started: Bool
+}
+
+enum Outbound: Codable {
+    case room(SRoom)
+    case system(String)
+    case chat(String)
+}
+
+// MARK: - In-memory state
 
 final class RoomManager {
+    struct Player {
+        let id: UUID
+        let name: String
+    }
+    struct Room {
+        let id: UUID
+        let code: String
+        var started: Bool
+        var players: [Player]
+    }
+
+    // room code -> Room
     var rooms: [String: Room] = [:]
+    // player id -> WebSocket
     var sockets: [UUID: WebSocket] = [:]
+    // player id -> room code
     var playerRoom: [UUID: String] = [:]
 
-    func join(room code: String, name: String, ws: WebSocket) -> (Room, Player) {
-        var room = rooms[code] ?? Room(id: UUID(), code: code, players: [], started: false)
-        let me = Player(id: UUID(), name: name)
-        room.players.append(me)
-        rooms[code] = room
-        sockets[me.id] = ws
-        playerRoom[me.id] = code
-        broadcast(room)
-        return (room, me)
+    func room(for code: String) -> Room {
+        if let r = rooms[code] { return r }
+        let created = Room(id: UUID(), code: code, started: false, players: [])
+        rooms[code] = created
+        return created
     }
 
-    func start(code: String) {
-        guard var r = rooms[code] else { return }
-        r.started = true
+    func addPlayer(name: String, to code: String) -> Player {
+        var r = room(for: code)
+        let p = Player(id: UUID(), name: name)
+        r.players.append(p)
         rooms[code] = r
-        broadcast(r)
+        playerRoom[p.id] = code
+        return p
     }
 
-    func broadcast(_ room: Room) {
-        do {
-            let text = String(data: try JSONEncoder().encode(Outbound.room(room)), encoding: .utf8)!
-            for (pid, ws) in sockets where playerRoom[pid] == room.code {
+    func removePlayer(_ id: UUID) {
+        guard let code = playerRoom[id], var r = rooms[code] else { return }
+        r.players.removeAll { $0.id == id }
+        rooms[code] = r
+        playerRoom[id] = nil
+        sockets[id] = nil
+    }
+
+    func snapshot(_ code: String) -> SRoom? {
+        guard let r = rooms[code] else { return nil }
+        let players = r.players.map { SPlayer(id: $0.id, name: $0.name) }
+        return SRoom(id: r.id, code: r.code, players: players, started: r.started)
+    }
+}
+
+// MARK: - App bootstrap
+
+@main
+struct Run {
+    static func main() throws {
+        var env = try Environment.detect()
+        try LoggingSystem.bootstrap(from: &env)
+        let app = Application(env)
+        defer { app.shutdown() }
+
+        let manager = RoomManager()
+
+        // Health check
+        app.get("health") { _ in "ok" }
+
+        // WebSocket endpoint: ws://host/ws?room=ABC123&name=Ali
+        app.webSocket("ws") { req, ws in
+            guard
+                let roomCode = req.query[String.self, at: "room"]?.uppercased(),
+                let name = req.query[String.self, at: "name"], !name.trimmingCharacters(in: .whitespaces).isEmpty
+            else {
+                ws.send("error: missing room or name")
+                ws.close(promise: nil)
+                return
+            }
+
+            // Register player
+            let player = manager.addPlayer(name: name, to: roomCode)
+            manager.sockets[player.id] = ws
+
+            // Send initial room snapshot
+            if let snapshot = manager.snapshot(roomCode),
+               let json = try? JSONEncoder().encode(Outbound.room(snapshot)),
+               let text = String(data: json, encoding: .utf8) {
                 ws.send(text)
             }
-        } catch {
-            print("broadcast error:", error)
-        }
-    }
 
-    func disconnect(playerID: UUID) {
-        sockets[playerID] = nil
-        if let code = playerRoom[playerID], var r = rooms[code] {
-            r.players.removeAll { $0.id == playerID }
-            rooms[code] = r
-            broadcast(r)
-        }
-        playerRoom[playerID] = nil
-    }
-}
+            // Broadcast "X joined" system message (optional)
+            broadcastSystem("joined:\(player.name)", in: roomCode, via: manager)
 
-let app = Application(.development)
-defer { app.shutdown() }
+            // Receive loop
+            ws.onText { ws, text in
+                // print raw
+                app.logger.info("WS(\(player.name)) -> \(text)")
 
-// Bind to 0.0.0.0 and honor PORT env (Render/Heroku style)
-app.http.server.configuration.hostname = "0.0.0.0"
-if let portStr = Environment.get("PORT"), let p = Int(portStr) {
-    app.http.server.configuration.port = p
-}
+                // Try decode as JSON map
+                if let data = text.data(using: .utf8),
+                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
 
-let manager = RoomManager()
-
-app.get("health") { _ in "ok" }
-
-app.webSocket("ws") { req, ws in
-    guard let code = req.query[String.self, at: "room"],
-          let name = req.query[String.self, at: "name"] else {
-        ws.close(promise: nil)
-        return
-    }
-
-    let (room, me) = manager.join(room: code, name: name, ws: ws)
-
-    ws.onText { ws, text in
-    if text == "\"start\"" {
-        manager.start(code: code)
-        return
-    }
-
-    // Try parse small JSON messages from clients
-    if let data = text.data(using: .utf8),
-       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-
-        // Broadcast phase change as a system message "phase:night" / "phase:day"
-        if let phase = obj["phase"] as? String, (phase == "night" || phase == "day") {
-            let sys = Outbound.system("phase:\(phase)")
-            if let sysText = String(data: try! JSONEncoder().encode(sys), encoding: .utf8) {
-                if let r = manager.rooms[code] {
-                    for (pid, peer) in manager.sockets where manager.playerRoom[pid] == r.code {
-                        peer.send(sysText)
+                    // 1) Phase change
+                    if let phase = obj["phase"] as? String,
+                       (phase == "night" || phase == "day") {
+                        let system = Outbound.system("phase:\(phase)")
+                        broadcast(system, in: roomCode, via: manager)
+                        return
                     }
+
+                    // 2) Chat
+                    if let msg = obj["chat"] as? String {
+                        let chat = Outbound.chat(msg)
+                        broadcast(chat, in: roomCode, via: manager)
+                        return
+                    }
+
+                    // 3) Vote relay  ——> clients tally anonymously
+                    //    Expected: { "type":"vote", "target":"<uuid-or-skip>", "from":"<name>", "code":"ABC123" }
+                    if let type = obj["type"] as? String, type == "vote",
+                       let target = obj["target"] as? String,
+                       let from = obj["from"] as? String {
+                        let sys = Outbound.system("vote:target:\(target):from:\(from)")
+                        broadcast(sys, in: roomCode, via: manager)
+                        return
+                    }
+
+                    // 4) Optional: start flag (if you want to propagate)
+                    if let start = obj["start"] as? Bool, start == true {
+                        // toggle started flag and broadcast room snapshot
+                        if var r = manager.rooms[roomCode] {
+                            r.started = true
+                            manager.rooms[roomCode] = r
+                            if let snap = manager.snapshot(roomCode),
+                               let json = try? JSONEncoder().encode(Outbound.room(snap)),
+                               let text = String(data: json, encoding: .utf8) {
+                                broadcastRaw(text, in: roomCode, via: manager)
+                            }
+                        }
+                        return
+                    }
+
+                    // Unknown JSON payload
+                    return
+                }
+
+                // Non-JSON: allow plain "start"
+                if text.trimmingCharacters(in: .whitespacesAndNewlines) == "start" {
+                    if var r = manager.rooms[roomCode] {
+                        r.started = true
+                        manager.rooms[roomCode] = r
+                        if let snap = manager.snapshot(roomCode),
+                           let json = try? JSONEncoder().encode(Outbound.room(snap)),
+                           let t = String(data: json, encoding: .utf8) {
+                            broadcastRaw(t, in: roomCode, via: manager)
+                        }
+                    }
+                    return
                 }
             }
-            return
-        }
 
-        // Mafia chat or global chat
-        if let msg = obj["chat"] as? String {
-            let chat = Outbound.chat(msg)
-            if let chatText = String(data: try! JSONEncoder().encode(chat), encoding: .utf8) {
-                if let r = manager.rooms[code] {
-                    for (pid, peer) in manager.sockets where manager.playerRoom[pid] == r.code {
-                        peer.send(chatText)
-                    }
-                }
+            // On close, clean up and notify
+            ws.onClose.whenComplete { _ in
+                manager.removePlayer(player.id)
+                broadcastSystem("left:\(player.name)", in: roomCode, via: manager)
             }
-            return
         }
+
+        // Serve
+        try app.run()
     }
 }
 
-    ws.onClose.whenComplete { _ in
-        manager.disconnect(playerID: me.id)
-    }
+// MARK: - Broadcast helpers
+
+private func broadcast(_ outbound: Outbound, in code: String, via manager: RoomManager) {
+    guard let text = try? String(data: JSONEncoder().encode(outbound), encoding: .utf8) else { return }
+    broadcastRaw(text, in: code, via: manager)
 }
 
-try app.run()
+private func broadcastSystem(_ s: String, in code: String, via manager: RoomManager) {
+    broadcast(.system(s), in: code, via: manager)
+}
+
+private func broadcastRaw(_ text: String, in code: String, via manager: RoomManager) {
+    guard manager.rooms[code] != nil else { return }
+    for (pid, ws) in manager.sockets where manager.playerRoom[pid] == code {
+        ws.send(text)
+    }
+}
