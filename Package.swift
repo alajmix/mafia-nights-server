@@ -2,18 +2,26 @@
 import PackageDescription
 
 let package = Package(
-    name: "MafiaServer",
-    platforms: [.macOS(.v13)],
+    name: "MafiaNightsServer",
+    platforms: [
+        .macOS(.v13)
+    ],
+    products: [
+        .executable(name: "Run", targets: ["Run"])
+    ],
     dependencies: [
+        // Vapor 4
         .package(url: "https://github.com/vapor/vapor.git", from: "4.92.0")
     ],
     targets: [
+        .target(name: "App", dependencies: [
+            .product(name: "Vapor", package: "vapor")
+        ],
+        path: "Sources/App"),
         .executableTarget(
-            name: "MafiaServer",
-            dependencies: [
-                .product(name: "Vapor", package: "vapor")
-            ],
-            path: "Sources"
+            name: "Run",
+            dependencies: ["App"],
+            path: "Sources/Run"
         )
     ]
 )
