@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: mafia-nights-server
+    env: docker
+    plan: free
+    autoDeploy: true
